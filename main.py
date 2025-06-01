@@ -29,7 +29,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",  # Vite default port
-        "https://your-frontend-domain.onrender.com",  # Add your frontend URL
+        "https://memory-frontend-faff.vercel.app",  # Add your frontend URL
         "https://*.onrender.com"  # Allow all Render domains
     ],
     allow_credentials=True,
