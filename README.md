@@ -1,6 +1,6 @@
 # Technical Overview: Memory Extraction and Management System
 
-This system is designed to extract, store, and manage meaningful "memories" from chat conversations. It employs a hybrid approach, combining rule-based methods with advanced Large Language Model (LLM) capabilities for nuanced understanding and intelligent memory handling. The system is built using Python, FastAPI, and Google's Gemini LLM, with a PostgreSQL database backend (as suggested by `database.py` and psycopg2 usage, though not explicitly detailed in `main.py`).
+This system is designed to extract, store, and manage meaningful "memories" from chat conversations. It employs a hybrid approach, combining rule-based methods with advanced Large Language Model (LLM) capabilities for nuanced understanding and intelligent memory handling. The system is built using Python, FastAPI, and Google's Gemini LLM, with a PostgreSQL database backend.
 
 ## Core Functionality
 
