@@ -8,13 +8,13 @@ import json
 import uuid
 import re
 from dataclasses import dataclass
-import sqlite3
 import hashlib
-from contextlib import contextmanager
 import google.generativeai as genai
-import os
 from dotenv import load_dotenv
 import uvicorn
+
+# Import database functions
+from database import get_db, init_database
 
 # Load environment variables
 load_dotenv()
@@ -59,65 +59,6 @@ class MemoryQuery(BaseModel):
     query: str
     chat_id: Optional[str] = None
     memory_types: Optional[List[str]] = None
-
-# local db
-# DATABASE_PATH = os.getenv("DATABASE_PATH", "memory_extraction.db")
-# Database setup
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/memory_extraction.db")
-
-def init_database():
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                message_id TEXT PRIMARY KEY,
-                timestamp TEXT,
-                sender TEXT,
-                content TEXT,
-                chat_id TEXT
-            )
-        """)
-        
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                memory_id TEXT PRIMARY KEY,
-                content TEXT,
-                memory_type TEXT,
-                confidence REAL,
-                source_messages TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                chat_id TEXT,
-                content_hash TEXT,
-                extraction_method TEXT DEFAULT 'rules',
-                reasoning TEXT
-            )
-        """)
-        
-        # Add new columns to existing tables if they don't exist
-        try:
-            conn.execute("ALTER TABLE memories ADD COLUMN extraction_method TEXT DEFAULT 'rules'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        
-        try:
-            conn.execute("ALTER TABLE memories ADD COLUMN reasoning TEXT")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_chat_id ON memories(chat_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_method ON memories(extraction_method)")
-
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
 
 # Memory Types Configuration
 MEMORY_TYPES = {
@@ -518,19 +459,19 @@ class MemoryUpdateManager:
     def _get_existing_memories(self, chat_id: str) -> List[Dict]:
         """Get all existing memories for a chat"""
         with get_db() as conn:
-            rows = conn.execute(
-                "SELECT * FROM memories WHERE chat_id = ?", (chat_id,)
-            ).fetchall()
-            memories = []
-            for row in rows:
-                memory = dict(row)
-                # Parse JSON strings back to lists/objects
-                try:
-                    memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
-                except (json.JSONDecodeError, TypeError):
-                    memory["source_messages"] = []
-                memories.append(memory)
-            return memories
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM memories WHERE chat_id = %s", (chat_id,))
+                rows = cursor.fetchall()
+                memories = []
+                for row in rows:
+                    memory = dict(row)
+                    # Parse JSON strings back to lists/objects
+                    try:
+                        memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
+                    except (json.JSONDecodeError, TypeError):
+                        memory["source_messages"] = []
+                    memories.append(memory)
+                return memories
         
     def update_or_create_memories(self, new_memories: List[Dict], chat_id: str) -> Dict:
         """Smart memory update system - updates existing memories or creates new ones"""
@@ -569,16 +510,16 @@ class MemoryUpdateManager:
     def _get_memory_by_id(self, memory_id: str) -> Dict:
         """Get a specific memory by ID"""
         with get_db() as conn:
-            row = conn.execute(
-                "SELECT * FROM memories WHERE memory_id = ?", (memory_id,)
-            ).fetchone()
-            if row:
-                memory = dict(row)
-                try:
-                    memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
-                except (json.JSONDecodeError, TypeError):
-                    memory["source_messages"] = []
-                return memory
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM memories WHERE memory_id = %s", (memory_id,))
+                row = cursor.fetchone()
+                if row:
+                    memory = dict(row)
+                    try:
+                        memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
+                    except (json.JSONDecodeError, TypeError):
+                        memory["source_messages"] = []
+                    return memory
         return None
     
     def _process_single_memory(self, new_memory: Dict, existing_memories: List[Dict], chat_id: str) -> Dict:
@@ -957,9 +898,10 @@ Return valid JSON:
     def _delete_similar_memories(self, similar_memories: List[Dict]):
         """Delete similar memories to avoid duplicates"""
         with get_db() as conn:
-            for sim_mem in similar_memories:
-                memory_id = sim_mem["memory"]["memory_id"]
-                conn.execute("DELETE FROM memories WHERE memory_id = ?", (memory_id,))
+            with conn.cursor() as cursor:
+                for sim_mem in similar_memories:
+                    memory_id = sim_mem["memory"]["memory_id"]
+                    cursor.execute("DELETE FROM memories WHERE memory_id = %s", (memory_id,))
             conn.commit()
 
     def _merge_memories(self, existing_memory: Dict, new_memory: Dict) -> Dict:
@@ -1008,24 +950,25 @@ Return valid JSON:
             memory["content_hash"] = hashlib.md5(memory["content"].encode()).hexdigest()
         
         with get_db() as conn:
-            conn.execute("""
-                INSERT INTO memories 
-                (memory_id, content, memory_type, confidence, source_messages, 
-                 created_at, updated_at, chat_id, content_hash, extraction_method, reasoning)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                memory["memory_id"],
-                memory["content"],
-                memory["memory_type"],
-                memory["confidence"],
-                json.dumps(memory["source_messages"]),
-                memory["created_at"].isoformat(),
-                memory["updated_at"].isoformat(),
-                memory["chat_id"],
-                memory["content_hash"],
-                memory.get("extraction_method", "rules"),
-                memory.get("reasoning", "")
-            ))
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO memories 
+                    (memory_id, content, memory_type, confidence, source_messages, 
+                     created_at, updated_at, chat_id, content_hash, extraction_method, reasoning)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    memory["memory_id"],
+                    memory["content"],
+                    memory["memory_type"],
+                    memory["confidence"],
+                    json.dumps(memory["source_messages"]),
+                    memory["created_at"],
+                    memory["updated_at"],
+                    memory["chat_id"],
+                    memory["content_hash"],
+                    memory.get("extraction_method", "rules"),
+                    memory.get("reasoning", "")
+                ))
             conn.commit()
         
         return memory["memory_id"]
@@ -1033,21 +976,22 @@ Return valid JSON:
     def _update_memory(self, memory: Dict) -> str:
         """Update existing memory"""
         with get_db() as conn:
-            conn.execute("""
-                UPDATE memories 
-                SET content = ?, confidence = ?, source_messages = ?, updated_at = ?, 
-                    extraction_method = ?, reasoning = ?, content_hash = ?
-                WHERE memory_id = ?
-            """, (
-                memory["content"],
-                memory["confidence"],
-                json.dumps(memory["source_messages"]),
-                memory["updated_at"].isoformat(),
-                memory.get("extraction_method", "rules"),
-                memory.get("reasoning", ""),
-                memory.get("content_hash", hashlib.md5(memory["content"].encode()).hexdigest()),
-                memory["memory_id"]
-            ))
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE memories 
+                    SET content = %s, confidence = %s, source_messages = %s, updated_at = %s, 
+                        extraction_method = %s, reasoning = %s, content_hash = %s
+                    WHERE memory_id = %s
+                """, (
+                    memory["content"],
+                    memory["confidence"],
+                    json.dumps(memory["source_messages"]),
+                    memory["updated_at"],
+                    memory.get("extraction_method", "rules"),
+                    memory.get("reasoning", ""),
+                    memory.get("content_hash", hashlib.md5(memory["content"].encode()).hexdigest()),
+                    memory["memory_id"]
+                ))
             conn.commit()
         
         return memory["memory_id"]
@@ -1078,86 +1022,90 @@ class MemoryManager:
     def save_memory(self, memory: Dict) -> str:
         """Save or update memory in database"""
         with get_db() as conn:
-            # Check for existing similar memory
-            existing = conn.execute(
-                "SELECT * FROM memories WHERE content_hash = ? AND chat_id = ?",
-                (memory.get("content_hash", ""), memory["chat_id"])
-            ).fetchone()
-            
-            if existing:
-                # Update existing memory
-                conn.execute("""
-                    UPDATE memories 
-                    SET content = ?, confidence = ?, source_messages = ?, updated_at = ?, 
-                        extraction_method = ?, reasoning = ?
-                    WHERE memory_id = ?
-                """, (
-                    memory["content"],
-                    memory["confidence"],
-                    json.dumps(memory["source_messages"]),
-                    memory["updated_at"].isoformat(),
-                    memory.get("extraction_method", "rules"),
-                    memory.get("reasoning", ""),
-                    existing["memory_id"]
-                ))
-                conn.commit()
-                return existing["memory_id"]
-            else:
-                # Insert new memory
-                conn.execute("""
-                    INSERT INTO memories 
-                    (memory_id, content, memory_type, confidence, source_messages, 
-                     created_at, updated_at, chat_id, content_hash, extraction_method, reasoning)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    memory["memory_id"],
-                    memory["content"],
-                    memory["memory_type"],
-                    memory["confidence"],
-                    json.dumps(memory["source_messages"]),
-                    memory["created_at"].isoformat(),
-                    memory["updated_at"].isoformat(),
-                    memory["chat_id"],
-                    memory.get("content_hash", ""),
-                    memory.get("extraction_method", "rules"),
-                    memory.get("reasoning", "")
-                ))
-                conn.commit()
-                return memory["memory_id"]
+            with conn.cursor() as cursor:
+                # Check for existing similar memory
+                cursor.execute(
+                    "SELECT * FROM memories WHERE content_hash = %s AND chat_id = %s",
+                    (memory.get("content_hash", ""), memory["chat_id"])
+                )
+                existing = cursor.fetchone()
+                
+                if existing:
+                    # Update existing memory
+                    cursor.execute("""
+                        UPDATE memories 
+                        SET content = %s, confidence = %s, source_messages = %s, updated_at = %s, 
+                            extraction_method = %s, reasoning = %s
+                        WHERE memory_id = %s
+                    """, (
+                        memory["content"],
+                        memory["confidence"],
+                        json.dumps(memory["source_messages"]),
+                        memory["updated_at"],
+                        memory.get("extraction_method", "rules"),
+                        memory.get("reasoning", ""),
+                        existing["memory_id"]
+                    ))
+                    conn.commit()
+                    return existing["memory_id"]
+                else:
+                    # Insert new memory
+                    cursor.execute("""
+                        INSERT INTO memories 
+                        (memory_id, content, memory_type, confidence, source_messages, 
+                         created_at, updated_at, chat_id, content_hash, extraction_method, reasoning)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        memory["memory_id"],
+                        memory["content"],
+                        memory["memory_type"],
+                        memory["confidence"],
+                        json.dumps(memory["source_messages"]),
+                        memory["created_at"],
+                        memory["updated_at"],
+                        memory["chat_id"],
+                        memory.get("content_hash", ""),
+                        memory.get("extraction_method", "rules"),
+                        memory.get("reasoning", "")
+                    ))
+                    conn.commit()
+                    return memory["memory_id"]
     
     def query_memories(self, query: str, chat_id: Optional[str] = None, 
                       memory_types: Optional[List[str]] = None) -> List[Dict]:
         """Query memories based on content and filters"""
         with get_db() as conn:
-            sql = "SELECT * FROM memories WHERE 1=1"
-            params = []
-            
-            if chat_id:
-                sql += " AND chat_id = ?"
-                params.append(chat_id)
-            
-            if memory_types:
-                placeholders = ",".join(["?" for _ in memory_types])
-                sql += f" AND memory_type IN ({placeholders})"
-                params.extend(memory_types)
-            
-            if query:
-                sql += " AND content LIKE ?"
-                params.append(f"%{query}%")
-            
-            sql += " ORDER BY confidence DESC, updated_at DESC"
-            
-            rows = conn.execute(sql, params).fetchall()
-            memories = []
-            for row in rows:
-                memory = dict(row)
-                # Parse JSON strings back to lists
-                try:
-                    memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
-                except (json.JSONDecodeError, TypeError):
-                    memory["source_messages"] = []
-                memories.append(memory)
-            return memories
+            with conn.cursor() as cursor:
+                sql = "SELECT * FROM memories WHERE 1=1"
+                params = []
+                
+                if chat_id:
+                    sql += " AND chat_id = %s"
+                    params.append(chat_id)
+                
+                if memory_types:
+                    placeholders = ",".join(["%s" for _ in memory_types])
+                    sql += f" AND memory_type IN ({placeholders})"
+                    params.extend(memory_types)
+                
+                if query:
+                    sql += " AND content ILIKE %s"
+                    params.append(f"%{query}%")
+                
+                sql += " ORDER BY confidence DESC, updated_at DESC"
+                
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                memories = []
+                for row in rows:
+                    memory = dict(row)
+                    # Parse JSON strings back to lists
+                    try:
+                        memory["source_messages"] = json.loads(memory["source_messages"]) if memory["source_messages"] else []
+                    except (json.JSONDecodeError, TypeError):
+                        memory["source_messages"] = []
+                    memories.append(memory)
+                return memories
 
 # Initialize components
 init_database()
@@ -1168,18 +1116,24 @@ memory_manager = MemoryManager()
 async def upload_chat_messages(messages: List[ChatMessage]):
     """Upload chat messages to the system"""
     with get_db() as conn:
-        for message in messages:
-            conn.execute("""
-                INSERT OR REPLACE INTO chat_messages 
-                (message_id, timestamp, sender, content, chat_id)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                message.message_id,
-                message.timestamp.isoformat(),
-                message.sender,
-                message.content,
-                message.chat_id
-            ))
+        with conn.cursor() as cursor:
+            for message in messages:
+                cursor.execute("""
+                    INSERT INTO chat_messages 
+                    (message_id, timestamp, sender, content, chat_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (message_id) DO UPDATE SET
+                    timestamp = EXCLUDED.timestamp,
+                    sender = EXCLUDED.sender,
+                    content = EXCLUDED.content,
+                    chat_id = EXCLUDED.chat_id
+                """, (
+                    message.message_id,
+                    message.timestamp,
+                    message.sender,
+                    message.content,
+                    message.chat_id
+                ))
         conn.commit()
     
     return {"status": "success", "uploaded": len(messages)}
@@ -1189,54 +1143,58 @@ async def upload_chat_messages(messages: List[ChatMessage]):
 async def cleanup_duplicate_memories(chat_id: str):
     """Clean up duplicate memories for a chat"""
     with get_db() as conn:
-        # Find duplicate address memories
-        address_memories = conn.execute("""
-            SELECT * FROM memories 
-            WHERE chat_id = ? AND memory_type = 'personal_info' 
-            AND (content LIKE '%address%' OR content LIKE '%street%' OR content LIKE '%avenue%')
-            ORDER BY updated_at DESC
-        """, (chat_id,)).fetchall()
-        
-        if len(address_memories) > 1:
-            # Keep the most recent one, delete the rest
-            keep_memory = address_memories[0]
-            delete_ids = [mem["memory_id"] for mem in address_memories[1:]]
+        with conn.cursor() as cursor:
+            # Find duplicate address memories
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE chat_id = %s AND memory_type = 'personal_info' 
+                AND (content ILIKE '%address%' OR content ILIKE '%street%' OR content ILIKE '%avenue%')
+                ORDER BY updated_at DESC
+            """, (chat_id,))
+            address_memories = cursor.fetchall()
             
-            for mem_id in delete_ids:
-                conn.execute("DELETE FROM memories WHERE memory_id = ?", (mem_id,))
+            if len(address_memories) > 1:
+                # Keep the most recent one, delete the rest
+                keep_memory = address_memories[0]
+                delete_ids = [mem["memory_id"] for mem in address_memories[1:]]
+                
+                for mem_id in delete_ids:
+                    cursor.execute("DELETE FROM memories WHERE memory_id = %s", (mem_id,))
+                
+                conn.commit()
+                
+                return {
+                    "status": "success",
+                    "kept_memory": dict(keep_memory),
+                    "deleted_count": len(delete_ids)
+                }
             
-            conn.commit()
-            
-            return {
-                "status": "success",
-                "kept_memory": dict(keep_memory),
-                "deleted_count": len(delete_ids)
-            }
-        
-        return {"status": "no_duplicates_found"}
+            return {"status": "no_duplicates_found"}
 
 @app.post("/api/memories/extract/{chat_id}")
 async def extract_memories(chat_id: str):
     """Extract and intelligently update memories from chat messages"""
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY timestamp",
-            (chat_id,)
-        ).fetchall()
-        
-        if not rows:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        
-        messages = [
-            ChatMessage(
-                message_id=row["message_id"],
-                timestamp=datetime.fromisoformat(row["timestamp"]),
-                sender=row["sender"],
-                content=row["content"],
-                chat_id=row["chat_id"]
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM chat_messages WHERE chat_id = %s ORDER BY timestamp",
+                (chat_id,)
             )
-            for row in rows
-        ]
+            rows = cursor.fetchall()
+            
+            if not rows:
+                raise HTTPException(status_code=404, detail="Chat not found")
+            
+            messages = [
+                ChatMessage(
+                    message_id=row["message_id"],
+                    timestamp=row["timestamp"],
+                    sender=row["sender"],
+                    content=row["content"],
+                    chat_id=row["chat_id"]
+                )
+                for row in rows
+            ]
     
     # Use smart processing
     results = memory_manager.process_new_memories(messages)
@@ -1263,15 +1221,17 @@ async def query_memories(query_request: MemoryQuery):
 async def get_chats():
     """Get list of all chats"""
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT chat_id, COUNT(*) as message_count, 
-                   MIN(timestamp) as first_message, 
-                   MAX(timestamp) as last_message
-            FROM chat_messages 
-            GROUP BY chat_id
-        """).fetchall()
-        
-        return {"chats": [dict(row) for row in rows]}
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT chat_id, COUNT(*) as message_count, 
+                       MIN(timestamp) as first_message, 
+                       MAX(timestamp) as last_message
+                FROM chat_messages 
+                GROUP BY chat_id
+            """)
+            rows = cursor.fetchall()
+            
+            return {"chats": [dict(row) for row in rows]}
 
 @app.get("/api/memory-types")
 async def get_memory_types():
@@ -1282,6 +1242,27 @@ async def get_memory_types():
 async def root():
     """Root endpoint"""
     return {"message": "Memory Extraction API", "docs": "/docs"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render"""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                result = cursor.fetchone()
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected" if result else "disconnected"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "error",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
